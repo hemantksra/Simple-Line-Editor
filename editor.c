@@ -13,6 +13,7 @@
  *   i <line_num> <text>  Insert <text> at line <line_num>
  *   d <line_num>         Delete the line at <line_num>
  *   p                    Print the entire document
+ *   s <query>            Search for a word or phrase
  *   q                    Quit and free all memory
  */
 
@@ -166,6 +167,53 @@ void doc_display(const Document *doc)
     }
 }
 
+/*
+ * Search every line for the substring <query> using strstr.
+ * Builds a list of matching line numbers and content previews into g_status.
+ * The search is case-sensitive. Sets g_status to report all matches or
+ * a "not found" message when there are none.
+ */
+void doc_search(const Document *doc, const char *query)
+{
+    if (doc->count == 0) {
+        set_status("Search: document is empty");
+        return;
+    }
+
+    if (query == NULL || query[0] == '\0') {
+        set_status("Error: search query is empty");
+        return;
+    }
+
+    int pos     = 0;
+    int matches = 0;
+
+    /* Write the header into g_status, then append each matching line. */
+    int n = snprintf(g_status, STATUS_LEN,
+                     "Search results for \"%s\":\n", query);
+    if (n > 0 && n < STATUS_LEN) pos = n;
+
+    for (int i = 0; i < doc->count; i++) {
+        if (strstr(doc->lines[i], query) != NULL) {
+            matches++;
+            n = snprintf(g_status + pos, (size_t)(STATUS_LEN - pos),
+                         "  Line %d: %s\n", i + 1, doc->lines[i]);
+            if (n < 0 || pos + n >= STATUS_LEN - 1) break;
+            pos += n;
+        }
+    }
+
+    if (matches == 0) {
+        set_status("Search: \"%s\" not found in any line", query);
+    } else {
+        /* Append the match count summary, trim trailing newline. */
+        n = snprintf(g_status + pos, (size_t)(STATUS_LEN - pos),
+                     "  (%d line%s matched)", matches, matches == 1 ? "" : "s");
+        if (n > 0) pos += n;
+        if (pos > 0 && g_status[pos - 1] == '\n') g_status[pos - 1] = '\0';
+    }
+}
+
 /* Free every line string and the lines array itself. */
 void doc_free(Document *doc)
 {
@@ -191,6 +239,9 @@ void print_menu(void)
     printf("|   e.g.  d 2                              |\n");
     printf("|                                          |\n");
     printf("| p               Print the document       |\n");
+    printf("|                                          |\n");
+    printf("| s <query>       Search for word/phrase   |\n");
+    printf("|   e.g.  s hello                          |\n");
     printf("|                                          |\n");
     printf("| q               Quit the editor          |\n");
     printf("+------------------------------------------+\n");
@@ -296,8 +347,23 @@ int main(void)
 
             doc_insert(&doc, (int)line_num_l, endptr);
 
+        } else if (cmd == 's') {
+            /* Expected format: "s <query>" — everything after 's ' is the search term. */
+            char *query = input + 1;
+
+            /* Skip leading whitespace. */
+            while (*query == ' ' || *query == '\t') {
+                query++;
+            }
+
+            if (*query == '\0') {
+                set_status("Error: missing query -- usage: s <word or phrase>");
+            } else {
+                doc_search(&doc, query);
+            }
+
         } else {
-            set_status("Error: unknown command '%c' -- use i, d, p, or q", cmd);
+            set_status("Error: unknown command '%c' -- use i, d, p, s, or q", cmd);
         }
     }
 
