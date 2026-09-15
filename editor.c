@@ -16,6 +16,7 @@
  *   s <query>                  Search for a word or phrase
  *   r <line_num|*> <old>/<new> Replace text on one line or all lines
  *   u                          Undo the last action
+ *   w                          Show document statistics
  *   q                          Quit and free all memory
  */
 
@@ -499,6 +500,51 @@ void doc_undo(Document *doc)
     g_undo_top--;
 }
 
+/*
+ * Count and report lines, words, and characters in the document.
+ * A word is a maximal sequence of non-whitespace characters.
+ * Character count excludes the implicit newline at the end of each line.
+ * Results are written into g_status for display in the status area.
+ */
+void doc_stats(const Document *doc)
+{
+    if (doc->count == 0) {
+        set_status("Stats: 0 lines | 0 words | 0 chars");
+        return;
+    }
+
+    int total_words = 0;
+    int total_chars = 0;
+    int longest_len = 0;
+
+    for (int i = 0; i < doc->count; i++) {
+        const char *p   = doc->lines[i];
+        int          len = (int)strlen(p);
+        total_chars += len;
+        if (len > longest_len) longest_len = len;
+
+        /* Count words: each non-whitespace run is one word. */
+        int in_word = 0;
+        while (*p != '\0') {
+            if (*p == ' ' || *p == '\t') {
+                in_word = 0;
+            } else {
+                if (!in_word) {
+                    total_words++;
+                    in_word = 1;
+                }
+            }
+            p++;
+        }
+    }
+
+    set_status("Stats: %d line%s | %d word%s | %d char%s | longest line: %d char%s",
+               doc->count,   doc->count   == 1 ? "" : "s",
+               total_words,  total_words  == 1 ? "" : "s",
+               total_chars,  total_chars  == 1 ? "" : "s",
+               longest_len,  longest_len  == 1 ? "" : "s");
+}
+
 /* Free every line string and the lines array itself. */
 void doc_free(Document *doc)
 {
@@ -532,6 +578,8 @@ void print_menu(void)
     printf("|   e.g.  r 2 old/new  or  r * old/new    |\n");
     printf("|                                          |\n");
     printf("| u               Undo last action         |\n");
+    printf("|                                          |\n");
+    printf("| w               Word / line count stats  |\n");
     printf("|                                          |\n");
     printf("| q               Quit the editor          |\n");
     printf("+------------------------------------------+\n");
@@ -713,8 +761,11 @@ int main(void)
         } else if (cmd == 'u') {
             doc_undo(&doc);
 
+        } else if (cmd == 'w') {
+            doc_stats(&doc);
+
         } else {
-            set_status("Error: unknown command '%c' -- use i, d, p, s, r, u, or q", cmd);
+            set_status("Error: unknown command '%c' -- use i, d, p, s, r, u, w, or q", cmd);
         }
     }
 
