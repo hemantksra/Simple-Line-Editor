@@ -15,6 +15,7 @@
  *   p                          Print the entire document
  *   s <query>                  Search for a word or phrase
  *   r <line_num|*> <old>/<new> Replace text on one line or all lines
+ *   u                          Undo the last action
  *   q                          Quit and free all memory
  */
 
@@ -23,8 +24,68 @@
 #include <string.h>
 #include <stdarg.h>
 
-#define MAX_LINE_LEN 256
-#define STATUS_LEN   4096
+#define MAX_LINE_LEN     256
+#define STATUS_LEN       4096
+#define UNDO_STACK_SIZE  32
+
+/* ------------------------------------------------------------------ */
+/* Undo subsystem                                                       */
+/* ------------------------------------------------------------------ */
+
+typedef enum { OP_INSERT, OP_DELETE, OP_REPLACE } OpType;
+
+/* One line that was changed during a replace operation. */
+typedef struct {
+    int   line_num;   /* 1-indexed */
+    char *old_text;   /* original content before replacement */
+} LineChange;
+
+/* A single reversible action recorded onto the undo stack. */
+typedef struct {
+    OpType      type;
+    int         line_num;     /* for INSERT / DELETE: the affected line */
+    char       *saved_text;   /* for DELETE: the deleted text */
+    LineChange *changes;      /* for REPLACE: array of per-line snapshots */
+    int         num_changes;  /* length of changes[] */
+} UndoEntry;
+
+static UndoEntry g_undo_stack[UNDO_STACK_SIZE];
+static int       g_undo_top     = 0; /* number of valid entries */
+static int       g_undo_enabled = 1; /* set to 0 inside doc_undo to avoid re-recording */
+
+/* Release all heap memory owned by one undo entry. */
+static void undo_entry_free(UndoEntry *e)
+{
+    free(e->saved_text);
+    e->saved_text = NULL;
+    for (int i = 0; i < e->num_changes; i++) {
+        free(e->changes[i].old_text);
+    }
+    free(e->changes);
+    e->changes     = NULL;
+    e->num_changes = 0;
+}
+
+/* Push an entry onto the stack, evicting the oldest if it is full. */
+static void undo_push(UndoEntry entry)
+{
+    if (g_undo_top == UNDO_STACK_SIZE) {
+        undo_entry_free(&g_undo_stack[0]);
+        memmove(&g_undo_stack[0], &g_undo_stack[1],
+                (UNDO_STACK_SIZE - 1) * sizeof(UndoEntry));
+        g_undo_top--;
+    }
+    g_undo_stack[g_undo_top++] = entry;
+}
+
+/* Free the entire undo stack (called on quit). */
+static void undo_stack_free(void)
+{
+    for (int i = 0; i < g_undo_top; i++) {
+        undo_entry_free(&g_undo_stack[i]);
+    }
+    g_undo_top = 0;
+}
 
 typedef struct {
     char **lines;
@@ -106,6 +167,12 @@ void doc_insert(Document *doc, int line_num, const char *text)
     doc->lines[line_num - 1] = new_line;
     doc->count++;
 
+    /* Record this insert so it can be undone (delete the same line). */
+    if (g_undo_enabled) {
+        UndoEntry e = {OP_INSERT, line_num, NULL, NULL, 0};
+        undo_push(e);
+    }
+
     set_status("[+] Line %d inserted: \"%s\"", line_num, new_line);
 }
 
@@ -127,12 +194,29 @@ void doc_delete(Document *doc, int line_num)
         return;
     }
 
-    /* Snapshot a preview of the deleted line for the status message. */
+    /*
+     * Save the full text before freeing it — needed both for the status
+     * preview and for the undo record.
+     */
+    char *deleted_text = doc->lines[line_num - 1];
+
+    /* Record the delete before the pointer is freed. */
+    if (g_undo_enabled) {
+        char *saved = malloc(MAX_LINE_LEN);
+        if (saved != NULL) {
+            strncpy(saved, deleted_text, MAX_LINE_LEN - 1);
+            saved[MAX_LINE_LEN - 1] = '\0';
+            UndoEntry e = {OP_DELETE, line_num, saved, NULL, 0};
+            undo_push(e);
+        }
+    }
+
+    /* Short preview for the status message. */
     char preview[48];
-    strncpy(preview, doc->lines[line_num - 1], sizeof(preview) - 1);
+    strncpy(preview, deleted_text, sizeof(preview) - 1);
     preview[sizeof(preview) - 1] = '\0';
 
-    free(doc->lines[line_num - 1]);
+    free(deleted_text);
 
     /* Shift remaining lines left to close the gap. */
     for (int i = line_num - 1; i < doc->count - 1; i++) {
@@ -285,20 +369,45 @@ void doc_replace(Document *doc, int line_num,
     int changed = 0; /* lines that had at least one substitution */
 
     if (line_num == 0) {
-        /* Global replace — scan every line. */
+        /* Global replace — scan every line, collecting undo snapshots. */
+        LineChange *changes    = NULL;
+        int         num_ch     = 0;
+        if (g_undo_enabled) {
+            changes = malloc((size_t)doc->count * sizeof(LineChange));
+        }
+
         for (int i = 0; i < doc->count; i++) {
-            int n = str_replace_all(doc->lines[i], old_text, new_text,
-                                    buf, MAX_LINE_LEN);
+            char *orig = doc->lines[i]; /* current pointer before modification */
+            int n = str_replace_all(orig, old_text, new_text, buf, MAX_LINE_LEN);
             if (n > 0) {
+                /* Save original content for undo before overwriting. */
+                if (changes != NULL) {
+                    changes[num_ch].old_text = malloc(MAX_LINE_LEN);
+                    if (changes[num_ch].old_text != NULL) {
+                        strncpy(changes[num_ch].old_text, orig, MAX_LINE_LEN - 1);
+                        changes[num_ch].old_text[MAX_LINE_LEN - 1] = '\0';
+                        changes[num_ch].line_num = i + 1;
+                        num_ch++;
+                    }
+                }
                 strncpy(doc->lines[i], buf, MAX_LINE_LEN - 1);
                 doc->lines[i][MAX_LINE_LEN - 1] = '\0';
                 total += n;
                 changed++;
             }
         }
+
         if (total == 0) {
+            /* No changes — discard the empty changes array. */
+            free(changes);
             set_status("Replace: \"%s\" not found in any line", old_text);
         } else {
+            if (g_undo_enabled && num_ch > 0) {
+                UndoEntry e = {OP_REPLACE, 0, NULL, changes, num_ch};
+                undo_push(e);
+            } else {
+                free(changes);
+            }
             set_status("[~] Replaced %d occurrence%s across %d line%s",
                        total,   total   == 1 ? "" : "s",
                        changed, changed == 1 ? "" : "s");
@@ -315,12 +424,79 @@ void doc_replace(Document *doc, int line_num,
         if (n == 0) {
             set_status("Replace: \"%s\" not found on line %d", old_text, line_num);
         } else {
+            /* Snapshot original before overwriting. */
+            if (g_undo_enabled) {
+                LineChange *ch = malloc(sizeof(LineChange));
+                if (ch != NULL) {
+                    ch[0].old_text = malloc(MAX_LINE_LEN);
+                    if (ch[0].old_text != NULL) {
+                        strncpy(ch[0].old_text, doc->lines[line_num - 1], MAX_LINE_LEN - 1);
+                        ch[0].old_text[MAX_LINE_LEN - 1] = '\0';
+                        ch[0].line_num = line_num;
+                        UndoEntry e = {OP_REPLACE, 0, NULL, ch, 1};
+                        undo_push(e);
+                    } else {
+                        free(ch);
+                    }
+                }
+            }
             strncpy(doc->lines[line_num - 1], buf, MAX_LINE_LEN - 1);
             doc->lines[line_num - 1][MAX_LINE_LEN - 1] = '\0';
             set_status("[~] Replaced %d occurrence%s on line %d",
                        n, n == 1 ? "" : "s", line_num);
         }
     }
+}
+
+/*
+ * Reverse the most recent action recorded on the undo stack.
+ * Suppresses further undo recording while performing the reversal.
+ */
+void doc_undo(Document *doc)
+{
+    if (g_undo_top == 0) {
+        set_status("Undo: nothing left to undo");
+        return;
+    }
+
+    UndoEntry *e = &g_undo_stack[g_undo_top - 1];
+    g_undo_enabled = 0; /* prevent the reversal from pushing a new entry */
+
+    switch (e->type) {
+        case OP_INSERT:
+            /* Reverse an insert by deleting that line. */
+            doc_delete(doc, e->line_num);
+            set_status("[U] Undo: removed inserted line %d", e->line_num);
+            break;
+
+        case OP_DELETE:
+            /* Reverse a delete by re-inserting the saved text. */
+            doc_insert(doc, e->line_num, e->saved_text);
+            set_status("[U] Undo: restored deleted line %d", e->line_num);
+            break;
+
+        case OP_REPLACE:
+            /* Reverse a replace by writing back each saved original. */
+            for (int i = 0; i < e->num_changes; i++) {
+                int ln = e->changes[i].line_num;
+                if (ln >= 1 && ln <= doc->count) {
+                    strncpy(doc->lines[ln - 1], e->changes[i].old_text, MAX_LINE_LEN - 1);
+                    doc->lines[ln - 1][MAX_LINE_LEN - 1] = '\0';
+                }
+            }
+            if (e->num_changes == 1) {
+                set_status("[U] Undo: reverted replacement on line %d",
+                           e->changes[0].line_num);
+            } else {
+                set_status("[U] Undo: reverted replacements across %d lines",
+                           e->num_changes);
+            }
+            break;
+    }
+
+    g_undo_enabled = 1;
+    undo_entry_free(e);
+    g_undo_top--;
 }
 
 /* Free every line string and the lines array itself. */
@@ -354,6 +530,8 @@ void print_menu(void)
     printf("|                                          |\n");
     printf("| r <n|*> <old>/<new>  Find & replace      |\n");
     printf("|   e.g.  r 2 old/new  or  r * old/new    |\n");
+    printf("|                                          |\n");
+    printf("| u               Undo last action         |\n");
     printf("|                                          |\n");
     printf("| q               Quit the editor          |\n");
     printf("+------------------------------------------+\n");
@@ -409,6 +587,7 @@ int main(void)
 
         } else if (cmd == 'q') {
             doc_free(&doc);
+            undo_stack_free();
             break;
 
         } else if (cmd == 'd') {
@@ -531,8 +710,11 @@ int main(void)
 
             doc_replace(&doc, target_line, old_text, new_text);
 
+        } else if (cmd == 'u') {
+            doc_undo(&doc);
+
         } else {
-            set_status("Error: unknown command '%c' -- use i, d, p, s, r, or q", cmd);
+            set_status("Error: unknown command '%c' -- use i, d, p, s, r, u, or q", cmd);
         }
     }
 
