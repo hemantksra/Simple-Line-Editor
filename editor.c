@@ -10,11 +10,12 @@
  *   > [input prompt]
  *
  * Commands:
- *   i <line_num> <text>  Insert <text> at line <line_num>
- *   d <line_num>         Delete the line at <line_num>
- *   p                    Print the entire document
- *   s <query>            Search for a word or phrase
- *   q                    Quit and free all memory
+ *   i <line_num> <text>        Insert <text> at line <line_num>
+ *   d <line_num>               Delete the line at <line_num>
+ *   p                          Print the entire document
+ *   s <query>                  Search for a word or phrase
+ *   r <line_num|*> <old>/<new> Replace text on one line or all lines
+ *   q                          Quit and free all memory
  */
 
 #include <stdio.h>
@@ -214,6 +215,114 @@ void doc_search(const Document *doc, const char *query)
     }
 }
 
+/*
+ * Replace all occurrences of <old> with <new_str> within <src>, writing
+ * the result into <dst> (at most dst_size - 1 characters).
+ * Returns the number of substitutions made.
+ */
+static int str_replace_all(const char *src, const char *old,
+                            const char *new_str, char *dst, size_t dst_size)
+{
+    size_t old_len = strlen(old);
+    size_t new_len = strlen(new_str);
+    size_t pos     = 0;
+    int    count   = 0;
+    const char *cursor = src;
+    const char *match;
+
+    if (old_len == 0 || dst_size == 0) return 0;
+
+    while ((match = strstr(cursor, old)) != NULL) {
+        /* Copy the text before the match. */
+        size_t prefix = (size_t)(match - cursor);
+        if (pos + prefix >= dst_size - 1) {
+            prefix = dst_size - 1 - pos;
+        }
+        memcpy(dst + pos, cursor, prefix);
+        pos += prefix;
+        if (pos >= dst_size - 1) break;
+
+        /* Copy the replacement text. */
+        size_t copy = (new_len < dst_size - 1 - pos) ? new_len : dst_size - 1 - pos;
+        memcpy(dst + pos, new_str, copy);
+        pos += copy;
+
+        cursor = match + old_len;
+        count++;
+        if (pos >= dst_size - 1) break;
+    }
+
+    /* Copy whatever remains after the last match. */
+    size_t tail = strlen(cursor);
+    if (pos + tail >= dst_size) tail = dst_size - 1 - pos;
+    memcpy(dst + pos, cursor, tail);
+    dst[pos + tail] = '\0';
+
+    return count;
+}
+
+/*
+ * Replace all occurrences of <old_text> with <new_text>.
+ * If line_num > 0, operates only on that 1-indexed line.
+ * If line_num == 0 (the user typed '*'), operates on every line.
+ * Reports total replacements and affected lines via g_status.
+ */
+void doc_replace(Document *doc, int line_num,
+                 const char *old_text, const char *new_text)
+{
+    if (doc->count == 0) {
+        set_status("Error: document is empty");
+        return;
+    }
+
+    if (old_text[0] == '\0') {
+        set_status("Error: find string cannot be empty");
+        return;
+    }
+
+    char buf[MAX_LINE_LEN];
+    int total = 0;  /* total substitutions */
+    int changed = 0; /* lines that had at least one substitution */
+
+    if (line_num == 0) {
+        /* Global replace — scan every line. */
+        for (int i = 0; i < doc->count; i++) {
+            int n = str_replace_all(doc->lines[i], old_text, new_text,
+                                    buf, MAX_LINE_LEN);
+            if (n > 0) {
+                strncpy(doc->lines[i], buf, MAX_LINE_LEN - 1);
+                doc->lines[i][MAX_LINE_LEN - 1] = '\0';
+                total += n;
+                changed++;
+            }
+        }
+        if (total == 0) {
+            set_status("Replace: \"%s\" not found in any line", old_text);
+        } else {
+            set_status("[~] Replaced %d occurrence%s across %d line%s",
+                       total,   total   == 1 ? "" : "s",
+                       changed, changed == 1 ? "" : "s");
+        }
+    } else {
+        /* Single-line replace. */
+        if (line_num < 1 || line_num > doc->count) {
+            set_status("Error: line number %d out of range (valid: 1-%d)",
+                       line_num, doc->count);
+            return;
+        }
+        int n = str_replace_all(doc->lines[line_num - 1], old_text, new_text,
+                                buf, MAX_LINE_LEN);
+        if (n == 0) {
+            set_status("Replace: \"%s\" not found on line %d", old_text, line_num);
+        } else {
+            strncpy(doc->lines[line_num - 1], buf, MAX_LINE_LEN - 1);
+            doc->lines[line_num - 1][MAX_LINE_LEN - 1] = '\0';
+            set_status("[~] Replaced %d occurrence%s on line %d",
+                       n, n == 1 ? "" : "s", line_num);
+        }
+    }
+}
+
 /* Free every line string and the lines array itself. */
 void doc_free(Document *doc)
 {
@@ -242,6 +351,9 @@ void print_menu(void)
     printf("|                                          |\n");
     printf("| s <query>       Search for word/phrase   |\n");
     printf("|   e.g.  s hello                          |\n");
+    printf("|                                          |\n");
+    printf("| r <n|*> <old>/<new>  Find & replace      |\n");
+    printf("|   e.g.  r 2 old/new  or  r * old/new    |\n");
     printf("|                                          |\n");
     printf("| q               Quit the editor          |\n");
     printf("+------------------------------------------+\n");
@@ -362,8 +474,65 @@ int main(void)
                 doc_search(&doc, query);
             }
 
+        } else if (cmd == 'r') {
+            /*
+             * Expected format: "r <line_num|*> <old>/<new>"
+             * line_num is a 1-based integer, or '*' meaning all lines.
+             * The first '/' in the text portion separates old from new.
+             */
+            char *rest = input + 1;
+            while (*rest == ' ' || *rest == '\t') rest++;
+
+            if (*rest == '\0') {
+                set_status("Error: usage: r <num|*> <old>/<new>");
+                continue;
+            }
+
+            /* Parse line number or '*'. */
+            int target_line;
+            char *after_num;
+            if (*rest == '*') {
+                target_line = 0; /* 0 means all lines */
+                after_num = rest + 1;
+            } else {
+                char *endptr;
+                long ln = strtol(rest, &endptr, 10);
+                if (endptr == rest) {
+                    set_status("Error: expected line number or '*' -- usage: r <num|*> <old>/<new>");
+                    continue;
+                }
+                target_line = (int)ln;
+                after_num = endptr;
+            }
+
+            /* Skip whitespace between number and text pair. */
+            while (*after_num == ' ' || *after_num == '\t') after_num++;
+
+            if (*after_num == '\0') {
+                set_status("Error: missing <old>/<new> -- usage: r <num|*> <old>/<new>");
+                continue;
+            }
+
+            /* Split on the first '/' to get old_text and new_text. */
+            char *slash = strchr(after_num, '/');
+            if (slash == NULL) {
+                set_status("Error: missing '/' separator -- usage: r <num|*> <old>/<new>");
+                continue;
+            }
+
+            *slash = '\0';              /* terminate old_text in-place */
+            const char *old_text = after_num;
+            const char *new_text = slash + 1;
+
+            if (old_text[0] == '\0') {
+                set_status("Error: find string cannot be empty");
+                continue;
+            }
+
+            doc_replace(&doc, target_line, old_text, new_text);
+
         } else {
-            set_status("Error: unknown command '%c' -- use i, d, p, s, or q", cmd);
+            set_status("Error: unknown command '%c' -- use i, d, p, s, r, or q", cmd);
         }
     }
 
